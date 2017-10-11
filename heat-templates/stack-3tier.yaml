@@ -1,0 +1,690 @@
+heat_template_version: 2016-10-14
+
+description: >-
+  template to boot a 3 tier application kind modeled like this:
+  - 5 VMs provisioning template ( 2 web servers, 2 application servers, 1 DB)
+  Auto scaling: scale up when the 50% of CPU usage persists for 5 minutes, scale down if the CPU usage falls down to 15% for 3 minutes
+  Load balancers: 1 for the web tier, the other for the application tier
+  2 vNICs per VM (tenant network corresponding to the layer + management)
+  Floating IP assignment: 1 IP from the Floating IP web server network x 1 IP assigned to the load balancer of the web tier, 1 IP from the Floating IP MGMT VM network x 1 IP assigned to each VM on the management tenant network 
+  Security groups: 1 for the web tier (sg_web), 1 for the application tier (sg_app), 1 for the DB tier (sg_db), 1 for the management network (sg_mgmt, all VMs) applied also   to lbaas 
+  Tenant: heat stack is designed to create every resources inside the tenant specified by the parameters tenant_id or using CF tenant mapping feature
+  Written by Michele Naldini (mnaldini@redhat.com) and Francesco Vollero (fvollero@redhat.com)
+
+
+parameters:
+  stack_prefix:
+    type: string
+    description: >
+      The hostname prefix that is going to be set for the nodes.
+    default: "3tier-as"
+
+  key:
+    type: string
+    default: root-osp
+    description: key to log into the machines
+
+  app_image:
+    type: string
+    description: Name of image to use for appservers
+    default: RHEL-7.4
+    constraints:
+    - custom_constraint: glance.image
+
+  db_image:
+    type: string
+    description: Name of image to use for database
+    default: RHEL-7.4
+    constraints:
+    - custom_constraint: glance.image
+
+  app_port:
+    type: number
+    default: 8080
+    description: Port used by the app servers
+  
+  webserver_port:
+    type: number
+    default: 80
+    description: Port used by the web servers
+
+  web_flavor:
+    type: string
+    description: Flavor used for webservers
+    default: m1.xsmall
+    constraints:
+    - custom_constraint: nova.flavor
+
+  app_flavor:
+    type: string
+    description: Flavor used for appservers
+    default: m1.xsmall
+    constraints:
+    - custom_constraint: nova.flavor
+
+  db_flavor:
+    type: string
+    description: Flavor used for database
+    default: m1.xsmall
+    constraints:
+    - custom_constraint: nova.flavor
+  
+  web_image:
+    type: string
+    description: Image used for servers
+    default: apache2
+    constraints:
+    - custom_constraint: glance.image
+
+  lb_port:
+    type: number
+    default: 80
+    description: Port used by the load balancer
+
+  management_network:
+    type: string
+    description: Network used to access the instances
+    default: a18e0aa1-88ab-44d3-b751-ec3dfa703060
+    constraints: 
+    - custom_constraint: neutron.network
+
+  web_provider_network:
+    type: string
+    description: Network used by the load balancer
+    default: a18e0aa1-88ab-44d3-b751-ec3dfa703060
+    constraints:
+    - custom_constraint: neutron.network
+  
+  volume_size:
+    type: number
+    description: volume size
+    default: 10
+  
+ # tenant_id:
+ #   type: string
+ #   description: default project id 
+ #   default: 2e9d437c55fc41bf87702aa842e345e6
+  
+  app_server_group:
+    type: string
+    description: metering.server_group for app servers
+    default: appservergroup
+
+  web_server_group:
+    type: string
+    description: metering.server_group for app servers
+    default: webservergroup
+
+
+resources:
+
+  internal_management_network:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: vm-management_network
+      #tenant_id: {get_param: tenant_id} 
+
+  management_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: vm-management-subnet
+      cidr: 172.16.0.0/24
+      enable_dhcp: true
+      dns_nameservers: [192.168.122.1]
+      network_id: { get_resource: internal_management_network}
+      #tenant_id: {get_param: tenant_id}
+
+  management-router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: {get_param: management_network}
+
+  management-router-interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: management-router }
+      subnet_id: { get_resource: management_subnet }
+
+  server_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: management_network }
+      port_id: { get_resource: internal_management_port }
+
+  internal_management_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: internal_management_network }
+      security_groups: [{get_resource: db_sg}, {get_resource: mgmt_sg}]
+     
+  internal_db_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: db_network }
+      security_groups: [{get_resource: db_sg}, {get_resource: mgmt_sg}]
+  
+  boot_volume_db:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: volume_size }
+      image: { get_param: db_image }
+
+  db-instance:
+    depends_on: [internal_management_network,db_network]
+    type: OS::Nova::Server
+    properties:
+      name: db-instance
+      image: { get_param: db_image }
+      key_name: {get_param: key}
+      flavor: { get_param: db_flavor}
+      #security_groups: [{get_resource: db_sg}, {get_resource: mgmt_sg}] 
+      block_device_mapping: [{"device_name": vda, "volume_id": { get_resource: boot_volume_db }, "delete_on_termination": false}] 
+      networks:
+        #- network: {get_resource: db_network}
+        #- network: {get_resource: internal_management_network}
+        - port: { get_resource: internal_management_port }
+        - port: { get_resource: internal_db_port }
+
+  
+  db_network:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: db-network
+      #tenant_id: {get_param: tenant_id}
+
+  db_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: db-subnet
+      cidr: 172.16.20.0/24
+      enable_dhcp: true
+      dns_nameservers: [192.168.122.1]
+      #gateway_ip: 172.16.20.254
+      network_id: { get_resource: db_network }
+      host_routes: [{"destination": 172.16.30.0/24, "nexthop": 172.16.20.254}]
+      #tenant_id: {get_param: tenant_id}
+
+  app_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: app_sg
+      rules:
+        #- remote_group_id: { get_resource: web_sg }
+        - remote_ip_prefix: { get_attr: [app_loadbalancer, vip_address] }
+          #remote_mode: remote_group_id
+          protocol: tcp
+          port_range_min: { get_param: app_port }
+          port_range_max: { get_param: app_port }
+
+
+  db_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Allow sql traffic from app tier
+      name: db_sg
+      rules:
+        - remote_group_id: { get_resource: app_sg }
+          remote_mode: remote_group_id
+          protocol: tcp
+          port_range_min: 1521
+          port_range_max: 1521
+
+
+  web_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Allow web traffic from anywhere
+      name: web_sg
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+        #- remote_ip_prefix: { get_attr: [web_loadbalancer, vip_address] }
+          protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          #- remote_ip_prefix: 0.0.0.0/0
+          #protocol: tcp
+          #port_range_min: 22
+          #port_range_max: 22
+  
+  mgmt_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: mgmt_sg
+      rules:
+      - remote_ip_prefix: 192.168.122.0/24
+        protocol: tcp
+        port_range_min: 22  
+        port_range_max: 22 
+      - remote_ip_prefix: 192.168.122.0/24
+        protocol: tcp
+        port_range_min: 22  
+        port_range_max: 22              
+ 
+  app_to_db_router:
+    type: OS::Neutron::Router
+    properties:
+      name: app-to-db-router
+
+  app_to_db_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: {get_resource: app_to_db_router}
+      port_id:   {get_resource: app_to_db_if_port}
+  
+  app_to_db_if_port:
+      type: OS::Neutron::Port
+      properties:
+        network_id: {get_resource: app_network}
+        fixed_ips: [{"ip_address": "172.16.30.253", "subnet": { get_resource: app_subnet}}]
+  
+  db_if_port:
+      type: OS::Neutron::Port
+      properties:
+        network_id: {get_resource: db_network}
+        fixed_ips: [{"ip_address": "172.16.20.254", "subnet": { get_resource: db_subnet}}]
+
+  db_to_app_interface:
+      depends_on: [db_if_port]
+      type: OS::Neutron::RouterInterface
+      properties:
+       router_id: {get_resource: app_to_db_router}
+       port: {get_resource: db_if_port} 
+
+  web-to-provider-router:
+    type: OS::Neutron::Router
+    properties:
+      admin_state_up: true
+      name: web-provider-router
+      external_gateway_info: { "network": { get_param: web_provider_network }}
+
+  web_to_provider_int:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: web-to-provider-router }
+      subnet_id: { get_resource: web_subnet }
+
+  web_network:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: web-network
+      #tenant_id: {get_param: tenant_id}
+      
+  
+  web_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: web-subnet
+      cidr: 172.16.10.0/24
+      enable_dhcp: true
+      dns_nameservers: [192.168.122.1]
+      network_id: { get_resource: web_network }
+      host_routes: [{"destination": 172.16.30.0/24, "nexthop": 172.16.10.254}]
+      #tenant_id: {get_param: tenant_id}
+
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+  app_network:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: app-network
+      #tenant_id: {get_param: tenant_id}
+
+  app_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: app-subnet
+      cidr: 172.16.30.0/24
+      enable_dhcp: true
+      dns_nameservers: [192.168.122.1]
+      network_id: { get_resource: app_network }
+      host_routes: [{"destination": 172.16.10.0/24, "nexthop": 172.16.30.254},{"destination": 172.16.20.0/24, "nexthop": 172.16.30.253}]
+      #tenant_id: {get_param: tenant_id}
+
+  app_asg:
+    depends_on: internal_management_network
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 2
+      max_size: 9
+      resource:
+        type: http://192.168.122.158:8888/lb-resource-stack-3tier.yaml
+        properties:
+          flavor: {get_param: app_flavor}
+          image: {get_param: app_image}
+          key_name: {get_param: key}
+          internal_network: {get_resource: internal_management_network}
+          provider_management_network: {get_param: management_network}
+          role_network: {get_resource: app_network}
+          role_subnet_id: {get_resource: app_subnet}
+          appliance_port: {get_param: app_port}
+          role_prefix: "app"
+          pool_id: {get_resource: app_pool}
+          security_groups: [{get_resource: app_sg}, {get_resource: mgmt_sg}]
+          metadata: {"metering.server_group": {get_param: app_server_group}}
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash -v
+                nmcli con add con-name eth1 ifname eth1 type ethernet
+                echo -e "Hello I'm $(hostname) and I got created on $(date) and I am part of stack_name" >> index.html
+                python -m SimpleHTTPServer 8080 &
+                wc_notify --data-binary '{"status": "SUCCESS"}'
+              params:
+                wc_notify: { get_attr: [wait_handle, curl_cli] }
+                stack_name: {get_param: "OS::stack_name"}
+
+  app_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: app_asg}
+      cooldown: 20
+      scaling_adjustment: 1
+  
+  app_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: app_asg}
+      cooldown: 20
+      scaling_adjustment: -1
+  
+  app_cpu_alarm_high:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm 
+    properties:
+      description: Scale-up if the average CPU > 50% for 5 minute
+      metric: cpu_util
+      resource_type: instance
+      aggregation_method: mean
+      threshold: 50
+      comparison_operator: gt
+      evaluation_periods: 1
+      granularity: 300
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [app_server_scaleup_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: "app_server_group"}
+
+  app_cpu_alarm_low:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale-down if the average CPU < 15% for 5 minute
+      metric: cpu_util
+      resource_type: instance
+      aggregation_method: mean
+      threshold: 15
+      comparison_operator: lt
+      evaluation_periods: 1
+      granularity: 300
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [app_server_scaledown_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: "app_server_group"}
+
+  app_monitor:
+    type: OS::Neutron::LBaaS::HealthMonitor
+    properties:
+      delay: 3
+      type: HTTP
+      timeout: 3
+      max_retries: 3
+      pool: { get_resource: app_pool }
+
+  app_pool:
+    type: OS::Neutron::LBaaS::Pool
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      listener: { get_resource: app_listener }
+
+  app_listener:
+    type: OS::Neutron::LBaaS::Listener
+    properties:
+      loadbalancer: { get_resource: app_loadbalancer }
+      protocol: HTTP
+      protocol_port: { get_param: app_port }
+      #tenant_id: {get_param: tenant_id}
+
+  app_loadbalancer:
+    type: OS::Neutron::LBaaS::LoadBalancer
+    properties:
+      vip_subnet: { get_resource: app_subnet }
+      #tenant_id: {get_param: tenant_id}
+
+  web_asg:
+    depends_on: app_asg
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 2
+      max_size: 9
+      resource:
+        type: http://192.168.122.158:8888/lb-resource-stack-3tier.yaml
+        properties:
+          flavor: {get_param: web_flavor}
+          image: {get_param: web_image}
+          key_name: {get_param: key}
+          internal_network: {get_resource: internal_management_network}
+          provider_management_network: {get_param: management_network}
+          role_network: {get_resource: web_network}
+          role_subnet_id: {get_resource: web_subnet}
+          appliance_port: {get_param: webserver_port}
+          role_prefix: "web"
+          pool_id: {get_resource: web_pool}
+          security_groups: [{get_resource: web_sg}, {get_resource: mgmt_sg}]
+          metadata: {"metering.server_group": {get_param: web_server_group}}
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash -v
+                nmcli con add con-name eth1 ifname eth1 type ethernet
+                sed -i "s/Copyright ©2017 Red Hat, Inc./I am $(hostname) created on $(date)/g" /var/www/html/www.redhat.com/en.html
+                sed -i 's/"copyright"/"copyright" style="color: #ff0000;"/g' /var/www/html/www.redhat.com/en.html
+                #echo -e "Hello I'm $(hostname) and I got created on $(date)" >> index.html
+                #python -m SimpleHTTPServer 8080 &
+                wc_notify --data-binary '{"status": "SUCCESS"}'
+              params:
+                wc_notify: { get_attr: [wait_handle, curl_cli] }
+
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_asg}
+      cooldown: 20
+      scaling_adjustment: 1
+  
+  web_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_asg}
+      cooldown: 20
+      scaling_adjustment: -1
+  
+  web_cpu_alarm_high:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm 
+    properties:
+      description: Scale-up if the average CPU > 50% for 1 minute
+      metric: cpu_util
+      resource_type: instance
+      aggregation_method: mean
+      threshold: 50
+      comparison_operator: gt
+      evaluation_periods: 1
+      granularity: 300
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [web_server_scaleup_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: web_server_group}
+  web_cpu_alarm_low:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale-down if the average CPU < 15% for 1 minute
+      metric: cpu_util
+      resource_type: instance
+      aggregation_method: mean
+      threshold: 15
+      comparison_operator: lt
+      evaluation_periods: 1
+      granularity: 300
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [web_server_scaledown_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: web_server_group}
+
+  web_monitor:
+    type: OS::Neutron::LBaaS::HealthMonitor
+    properties:
+      delay: 3
+      type: HTTP
+      timeout: 3
+      max_retries: 3
+      pool: { get_resource: web_pool }
+
+  web_pool:
+    type: OS::Neutron::LBaaS::Pool
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      listener: { get_resource: web_listener }
+
+  web_listener:
+    type: OS::Neutron::LBaaS::Listener
+    properties:
+      loadbalancer: { get_resource: web_loadbalancer }
+      protocol: HTTP
+      protocol_port: { get_param: lb_port }
+      #tenant_id: {get_param: tenant_id}
+
+  web_loadbalancer:
+    depends_on: web_to_provider_int
+    type: OS::Neutron::LBaaS::LoadBalancer
+    properties:
+      vip_subnet: { get_resource: web_subnet }
+      #tenant_id: {get_param: tenant_id}
+
+  web_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: web_provider_network }
+      port_id: { get_attr: [web_loadbalancer, vip_port_id ]}
+
+  web_to_app_router:
+   type: OS::Neutron::Router
+   properties:
+     name: web-to-app-router
+
+  web_to_app_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: {get_resource: web_to_app_router}
+      port_id:   {get_resource: web_port}
+  
+  web_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: {get_resource: web_network}
+      fixed_ips: [{"ip_address": "172.16.10.254", "subnet": { get_resource: web_subnet}}]
+
+  app_if_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: {get_resource: app_network}
+      fixed_ips: [{"ip_address": "172.16.30.254", "subnet": { get_resource: app_subnet }}]
+
+  app_to_web_interface:
+    depends_on: [app_if_port]
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: {get_resource: web_to_app_router}
+      port: {get_resource: app_if_port} 
+
+outputs:
+    
+  web_scale_up_url:
+    description: >
+      This URL is the webhook to scale up the autoscaling group.  You
+      can invoke the scale-up operation by doing an HTTP POST to this
+      URL; no body nor extra headers are needed.
+    value: {get_attr: [web_server_scaleup_policy, alarm_url]}
+  
+  web_scale_dn_url:
+    description: >
+      This URL is the webhook to scale down the autoscaling group.
+      You can invoke the scale-down operation by doing an HTTP POST to
+      this URL; no body nor extra headers are needed.
+    value: {get_attr: [web_server_scaledown_policy, alarm_url]}
+
+  app_scale_up_url:
+    description: >
+      This URL is the webhook to scale up the autoscaling group.  You
+      can invoke the scale-up operation by doing an HTTP POST to this
+      URL; no body nor extra headers are needed.
+    value: {get_attr: [app_server_scaleup_policy, alarm_url]}
+
+  app_scale_dn_url:
+    description: >
+      This URL is the webhook to scale down the autoscaling group.
+      You can invoke the scale-down operation by doing an HTTP POST to
+      this URL; no body nor extra headers are needed.
+    value: {get_attr: [app_server_scaledown_policy, alarm_url]}
+
+  weblburl:
+    value:
+      str_replace:
+        template: http://IP_ADDRESS:PORT
+        params:
+          IP_ADDRESS: { get_attr: [ web_floating_ip, floating_ip_address ] }
+          PORT: { get_param: lb_port }
+    description: >
+      This URL is the "external" URL that can be used to access the
+
+  server_networks:
+    description: The networks of APP_ASG
+    value: { get_attr: [app_asg, outputs,show] }
+
+  applburl:
+    value:
+      str_replace:
+        template: http://IP_ADDRESS:PORT
+        params:
+          IP_ADDRESS: {get_attr: [app_loadbalancer, vip_address]}
+          PORT: { get_param: app_port }
+    description: >
+      This URL is the "external" URL that can be used to access the
+
+  web_asg_output:
+    value: {get_attr: [web_asg, outputs,show]}
+
+  app_asg_output:
+     value: {get_attr: [app_asg,outputs,server_all,show]}

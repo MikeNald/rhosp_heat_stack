@@ -1,0 +1,114 @@
+heat_template_version: 2016-10-14
+description: A load-balancer server
+parameters:
+  image:
+    type: string
+    description: Image used for servers
+  key_name:
+    type: string
+    description: SSH key to connect to the servers
+  flavor:
+    type: string
+    description: flavor used by the servers
+  role_prefix:
+    type: string
+  pool_id:
+    type: string
+    description: Pool to contact
+  user_data:
+    type: string
+    description: Server user_data
+  metadata:
+    type: json
+  appliance_port:
+    type: string
+    description: Port used by the appliance
+  internal_network:
+    type: string
+    description: Network used by the server
+  role_subnet_id:
+    type: string
+    description: subnet used by the server
+  security_groups:
+    type: comma_delimited_list 
+    description: security groups used by the server
+  provider_management_network:
+    type: string
+    description: network for management (floating)
+  role_network:
+    type: string
+    description: role network
+  volume_size:
+    type: number
+    description: volume size
+    default: 10
+
+    
+resources:
+  
+  random_hostname_suffix:
+    type: OS::Heat::RandomString
+    properties:
+      character_classes: [{"class": lowercase}, {"class": digits}]
+      length: 4
+
+  internal_management_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: internal_network }
+      security_groups: { get_param: security_groups }
+
+  server_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: provider_management_network }
+      port_id: { get_resource: internal_management_port }
+
+  role_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: role_network }
+      security_groups: {get_param: security_groups}
+  
+  boot_volume:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: volume_size }
+      image: { get_param: image }
+      
+  server:
+    type: OS::Nova::Server
+    properties:
+      name:
+        str_replace:
+          template: "ROLE_SUFFIX"
+          params:
+            ROLE: {get_param: role_prefix}
+            SUFFIX: {get_attr: [random_hostname_suffix, value]}
+      flavor: {get_param: flavor}
+      image: {get_param: image}
+      block_device_mapping: [{"device_name": vda, "volume_id": { get_resource: boot_volume }, "delete_on_termination": false}]      
+      key_name: {get_param: key_name}
+      metadata: {get_param: metadata}
+      user_data: {get_param: user_data}
+      user_data_format: RAW
+      networks:
+        - port: { get_resource: internal_management_port }
+        - port: { get_resource: role_port }
+      #security_groups: {get_param: security_groups}
+
+  member:
+    type: OS::Neutron::LBaaS::PoolMember
+    properties:
+      pool: {get_param: pool_id}
+      address: { get_attr: [role_port, fixed_ips, 0, ip_address] }
+      protocol_port: {get_param: appliance_port}
+      subnet: {get_param: role_subnet_id}
+
+outputs:
+  server_ip:
+    description: IP Address of the load-balanced server.
+    value: { get_attr: [role_port, fixed_ips, 0, ip_address] }
+  lb_member:
+    description: LB member details.
+    value: { get_attr: [member, show] }
