@@ -30,7 +30,7 @@ with a real app server (jboss eap for instance) and a db like mysql/postgres or 
 scale down if the CPU usage falls down to 15% for 3 minutes
   
 ## Load balancers: 1 for the web tier, the other for the application tier
-Fe lbaas exposed by Floating IP on port tcp 80, lbaas reacheable internally from web server layer
+Fe lbaas is exposed by a Floating IP on port tcp 80, app servers lbaas is reacheable internally from web server layer
 2 vNICs per VM (tenant network corresponding to the layer + management)
   
 Floating IP assignment: 1 IP from the Floating IP web server network, 1 IP from the Floating IP MGMT VM network
